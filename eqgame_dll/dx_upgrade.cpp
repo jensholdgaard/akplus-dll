@@ -168,6 +168,8 @@ static bool CreateD3D11Device()
 			if (desc.VendorId == 0x10DE) // NVIDIA
 			{
 				g_isNvidiaGPU = true;
+				if (selectedAdapter)
+					selectedAdapter->Release();
 				selectedAdapter = adapter;
 				break;
 			}
