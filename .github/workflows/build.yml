@@ -1,0 +1,39 @@
+name: Build DLL
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    strategy:
+      matrix:
+        configuration: [Release, Debug]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build ${{ matrix.configuration }}
+        run: msbuild eqgame_dll.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=Win32
+        env:
+          DXSDK_DIR: ${{ github.workspace }}/dxsdk81
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eqgame-dll-${{ matrix.configuration }}
+          path: |
+            ${{ matrix.configuration }}/eqgame.dll
+            ${{ matrix.configuration }}/eqgame.pdb
