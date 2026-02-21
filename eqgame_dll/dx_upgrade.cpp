@@ -69,7 +69,7 @@ typedef HRESULT(__stdcall* D3D8GetDisplayMode_t)(
 // ---------------------------------------------------------------------------
 static bool g_dxUpgradeInitialized = false;
 static bool g_dxUpgradeActive = false;
-static DXUpgradeConfig g_dxConfig = { false, UPSCALE_OFF, 100, false };
+static DXUpgradeConfig g_dxConfig = { false };
 
 // DX8 device pointer location (in EQGfx_Dx8.dll)
 static DWORD g_d3d8DevicePtr = 0;
@@ -81,18 +81,15 @@ static D3D8Reset_t g_originalReset = nullptr;
 // Game window
 static HWND g_gameHwnd = 0;
 
-// DXGI / D3D11 objects for upscaling pipeline
+// DXGI / D3D11 objects
 static IDXGIFactory1* g_dxgiFactory = nullptr;
 static IDXGIAdapter1* g_dxgiAdapter = nullptr;
 static ID3D11Device* g_d3d11Device = nullptr;
 static ID3D11DeviceContext* g_d3d11Context = nullptr;
 static IDXGISwapChain* g_dxgiSwapChain = nullptr;
 
-// D3D11 staging texture for receiving DX8 frame data
+// D3D11 staging texture for receiving DX8 frame data via GDI
 static ID3D11Texture2D* g_stagingTexture = nullptr;
-// D3D11 render target for upscaled output
-static ID3D11Texture2D* g_outputTexture = nullptr;
-static ID3D11RenderTargetView* g_outputRTV = nullptr;
 
 // Frame dimensions
 static UINT g_frameWidth = 0;
@@ -108,8 +105,8 @@ static char g_gpuName[128] = { 0 };
 // Forward declarations
 // ---------------------------------------------------------------------------
 static bool CreateD3D11Device();
-static bool CreateUpscaleResources(UINT width, UINT height);
-static void ReleaseUpscaleResources();
+static bool CreateStagingTexture(UINT width, UINT height);
+static void ReleaseStagingTexture();
 static void ReleaseD3D11Device();
 static bool HookDX8Present();
 static void UnhookDX8Present();
@@ -161,7 +158,7 @@ static bool CreateD3D11Device()
 	if (FAILED(hr) || !g_dxgiFactory)
 		return false;
 
-	// Find the best adapter (prefer NVIDIA for DLSS)
+	// Find the best adapter (prefer NVIDIA if present)
 	IDXGIAdapter1* selectedAdapter = nullptr;
 	IDXGIAdapter1* adapter = nullptr;
 
@@ -266,21 +263,20 @@ static bool CreateSwapChain(HWND hwnd, UINT width, UINT height)
 }
 
 // ---------------------------------------------------------------------------
-// Upscale Resources (staging texture for DX8->DX11 copy, output texture)
+// Staging Texture (CPU-writable texture for DX8->DX11 frame copy via GDI)
 // ---------------------------------------------------------------------------
-static bool CreateUpscaleResources(UINT width, UINT height)
+static bool CreateStagingTexture(UINT width, UINT height)
 {
 	if (!g_d3d11Device)
 		return false;
 
-	// Staging texture: CPU-writable, used to upload DX8 frame data to GPU
 	D3D11_TEXTURE2D_DESC stagingDesc;
 	ZeroMemory(&stagingDesc, sizeof(stagingDesc));
 	stagingDesc.Width = width;
 	stagingDesc.Height = height;
 	stagingDesc.MipLevels = 1;
 	stagingDesc.ArraySize = 1;
-	stagingDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; // DX8 typically uses BGRA
+	stagingDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; // Matches GDI BGRA output
 	stagingDesc.SampleDesc.Count = 1;
 	stagingDesc.Usage = D3D11_USAGE_DYNAMIC;
 	stagingDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -290,36 +286,14 @@ static bool CreateUpscaleResources(UINT width, UINT height)
 	if (FAILED(hr))
 		return false;
 
-	// Output texture: GPU render target for upscaled output
-	D3D11_TEXTURE2D_DESC outputDesc;
-	ZeroMemory(&outputDesc, sizeof(outputDesc));
-	outputDesc.Width = width;
-	outputDesc.Height = height;
-	outputDesc.MipLevels = 1;
-	outputDesc.ArraySize = 1;
-	outputDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; // Matches staging/swap chain format
-	outputDesc.SampleDesc.Count = 1;
-	outputDesc.Usage = D3D11_USAGE_DEFAULT;
-	outputDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-
-	hr = g_d3d11Device->CreateTexture2D(&outputDesc, NULL, &g_outputTexture);
-	if (FAILED(hr))
-		return false;
-
-	hr = g_d3d11Device->CreateRenderTargetView(g_outputTexture, NULL, &g_outputRTV);
-	if (FAILED(hr))
-		return false;
-
 	g_frameWidth = width;
 	g_frameHeight = height;
 
 	return true;
 }
 
-static void ReleaseUpscaleResources()
+static void ReleaseStagingTexture()
 {
-	if (g_outputRTV) { g_outputRTV->Release(); g_outputRTV = nullptr; }
-	if (g_outputTexture) { g_outputTexture->Release(); g_outputTexture = nullptr; }
 	if (g_stagingTexture) { g_stagingTexture->Release(); g_stagingTexture = nullptr; }
 }
 
@@ -328,7 +302,7 @@ static void ReleaseUpscaleResources()
 // ---------------------------------------------------------------------------
 static void ReleaseD3D11Device()
 {
-	ReleaseUpscaleResources();
+	ReleaseStagingTexture();
 	if (g_dxgiSwapChain) { g_dxgiSwapChain->Release(); g_dxgiSwapChain = nullptr; }
 	if (g_d3d11Context) { g_d3d11Context->Release(); g_d3d11Context = nullptr; }
 	if (g_d3d11Device) { g_d3d11Device->Release(); g_d3d11Device = nullptr; }
@@ -385,7 +359,9 @@ static bool CaptureFrameToStaging()
 
 	HGDIOBJ hOld = SelectObject(hdcMem, hBitmap);
 
-	// Copy the game window's rendered content into our bitmap
+	// Copy the game window's rendered content into our bitmap.
+	// Note: BitBlt is CPU-bound and adds per-frame overhead (~1-3ms at 1080p).
+	// This is a fundamental limitation of bridging DX8→DX11 via GDI.
 	BOOL bltResult = BitBlt(hdcMem, 0, 0, (int)g_frameWidth, (int)g_frameHeight,
 		hdcWindow, 0, 0, SRCCOPY);
 
@@ -439,9 +415,7 @@ static bool CopyStagingToSwapChain()
 	if (FAILED(hr) || !pBackBuffer)
 		return false;
 
-	// Copy the staging texture to the back buffer
-	// The staging texture is BGRA, back buffer is RGBA — CopyResource handles
-	// format conversion if the textures are compatible in dimension/type
+	// Copy the staging texture to the back buffer (both are B8G8R8A8_UNORM)
 	g_d3d11Context->CopyResource(pBackBuffer, g_stagingTexture);
 
 	pBackBuffer->Release();
@@ -483,17 +457,11 @@ static HRESULT __stdcall HookedPresent(
 	if (!CaptureFrameToStaging())
 		return hr;
 
-	// Step 2: (Future) Apply DLSS/FSR upscaling here
-	// If upscaleMode != UPSCALE_OFF && g_isNvidiaGPU:
-	//   NVSDK_NGX_D3D11_EvaluateFeature(g_d3d11Context, ...)
-	//   Copy g_outputTexture → swap chain back buffer
-	// Else: pass-through (copy staging directly to swap chain)
-
-	// Step 3: Copy the staging texture (or upscaled output) to the swap chain
+	// Step 2: Copy the staging texture to the swap chain back buffer
 	CopyStagingToSwapChain();
 
-	// Step 4: Present the frame through the DXGI swap chain
-	g_dxgiSwapChain->Present(g_dxConfig.upscaleMode != UPSCALE_OFF ? 0 : 1, 0);
+	// Step 3: Present the frame through the DXGI swap chain (no VSync)
+	g_dxgiSwapChain->Present(0, 0);
 
 	return hr;
 }
@@ -508,8 +476,8 @@ static HRESULT __stdcall HookedReset(
 	void* pDevice,
 	void* pPresentationParameters)
 {
-	// Release our upscale resources before the device reset
-	ReleaseUpscaleResources();
+	// Release staging texture before the device reset
+	ReleaseStagingTexture();
 	if (g_dxgiSwapChain)
 	{
 		g_dxgiSwapChain->Release();
@@ -519,10 +487,9 @@ static HRESULT __stdcall HookedReset(
 	// Call original Reset
 	HRESULT hr = g_originalReset(pDevice, pPresentationParameters);
 
-	// Recreate resources if reset succeeded and upgrade is still enabled
+	// Recreate resources if reset succeeded and bridge is still enabled
 	if (SUCCEEDED(hr) && g_dxConfig.enabled)
 	{
-		// Re-read window dimensions
 		RECT clientRect;
 		if (GetClientRect(g_gameHwnd, &clientRect))
 		{
@@ -531,7 +498,7 @@ static HRESULT __stdcall HookedReset(
 			if (newWidth > 0 && newHeight > 0)
 			{
 				CreateSwapChain(g_gameHwnd, newWidth, newHeight);
-				CreateUpscaleResources(newWidth, newHeight);
+				CreateStagingTexture(newWidth, newHeight);
 			}
 		}
 	}
@@ -623,25 +590,6 @@ DXUpgradeConfig LoadDXUpgradeConfig()
 	GetPrivateProfileStringA("DXUpgrade", "Enabled", szDefault, szResult, 255, "./eqclient.ini");
 	config.enabled = (!strcmp(szResult, "TRUE") || !strcmp(szResult, "true") || !strcmp(szResult, "1"));
 
-	// [DXUpgrade] UpscaleMode=0  (0=off, 1=quality, 2=balanced, 3=performance, 4=ultra_performance)
-	sprintf(szDefault, "%d", 0);
-	GetPrivateProfileStringA("DXUpgrade", "UpscaleMode", szDefault, szResult, 255, "./eqclient.ini");
-	config.upscaleMode = atoi(szResult);
-	if (config.upscaleMode < UPSCALE_OFF || config.upscaleMode > UPSCALE_ULTRA_PERF)
-		config.upscaleMode = UPSCALE_OFF;
-
-	// [DXUpgrade] RenderScale=100 (25-100, internal render resolution percentage)
-	sprintf(szDefault, "%d", 100);
-	GetPrivateProfileStringA("DXUpgrade", "RenderScale", szDefault, szResult, 255, "./eqclient.ini");
-	config.renderScale = atoi(szResult);
-	if (config.renderScale < 25) config.renderScale = 25;
-	if (config.renderScale > 100) config.renderScale = 100;
-
-	// [DXUpgrade] EnableHDR=FALSE
-	sprintf(szDefault, "%s", "FALSE");
-	GetPrivateProfileStringA("DXUpgrade", "EnableHDR", szDefault, szResult, 255, "./eqclient.ini");
-	config.enableHDR = (!strcmp(szResult, "TRUE") || !strcmp(szResult, "true") || !strcmp(szResult, "1"));
-
 	return config;
 }
 
@@ -660,16 +608,10 @@ bool InitDXUpgrade(DWORD d3dDevicePtr, HWND hwnd)
 	g_d3d8DevicePtr = d3dDevicePtr;
 	g_gameHwnd = hwnd;
 
-	// Check for NVIDIA GPU (required for DLSS)
+	// Detect GPU vendor (informational only)
 	g_isNvidiaGPU = CheckNvidiaGPU();
 
-	// If DLSS upscaling is requested but no NVIDIA GPU, disable upscaling
-	if (g_dxConfig.upscaleMode != UPSCALE_OFF && !g_isNvidiaGPU)
-	{
-		g_dxConfig.upscaleMode = UPSCALE_OFF;
-	}
-
-	// Create the D3D11 device for the upscaling pipeline
+	// Create the D3D11 device
 	if (!CreateD3D11Device())
 	{
 		return false;
@@ -691,15 +633,15 @@ bool InitDXUpgrade(DWORD d3dDevicePtr, HWND hwnd)
 		return false;
 	}
 
-	// Create swap chain for DXGI presentation
+	// Create DXGI swap chain
 	if (!CreateSwapChain(hwnd, width, height))
 	{
 		ReleaseD3D11Device();
 		return false;
 	}
 
-	// Create upscale resources (staging texture, output render target)
-	if (!CreateUpscaleResources(width, height))
+	// Create staging texture for DX8 → DX11 frame copy
+	if (!CreateStagingTexture(width, height))
 	{
 		ReleaseD3D11Device();
 		return false;
@@ -742,4 +684,9 @@ bool IsDXUpgradeActive()
 const DXUpgradeConfig& GetDXUpgradeConfig()
 {
 	return g_dxConfig;
+}
+
+const char* GetDXUpgradeGPUName()
+{
+	return g_gpuName;
 }

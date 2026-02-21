@@ -1,61 +1,54 @@
 # eqgame_dll
 
-## DirectX Upgrade & DLSS Support
+## DX11 Rendering Bridge
 
-The DLL includes a DirectX upgrade module that enables newer DirectX features
-for the EverQuest client, which natively uses DirectX 8. This provides a path
-to support NVIDIA DLSS 4 and other modern upscaling technologies.
+The DLL includes a DirectX 11 bridge module that creates a parallel D3D11
+device alongside EverQuest's native DirectX 8 renderer. It hooks the DX8
+Present call and captures each rendered frame into a D3D11 texture, then
+presents it through a modern DXGI swap chain.
 
 ### How It Works
 
-The DX upgrade module hooks the DirectX 8 device's presentation pipeline and
-creates a parallel DirectX 11 device for upscaling:
+1. **DX8 Present Hook** — Intercepts every frame via vtable patching of the
+   IDirect3DDevice8 interface.
+2. **GDI Frame Capture** — After DX8 presents, captures the rendered frame
+   from the game window using `BitBlt` into a 32bpp BGRA bitmap.
+3. **D3D11 Staging Texture** — Uploads the captured pixels into a
+   CPU-writable D3D11 dynamic texture.
+4. **DXGI Swap Chain** — Copies the staging texture to the swap chain back
+   buffer and presents via DXGI.
 
-1. **DX8 Present Hook** - Intercepts every frame presented by the DX8 renderer
-   via vtable patching of the IDirect3DDevice8 interface.
-2. **D3D11 Device** - Creates a DirectX 11 device on the same GPU adapter,
-   preferring NVIDIA GPUs for DLSS compatibility.
-3. **DXGI Swap Chain** - Sets up a modern DXGI swap chain for presenting
-   upscaled frames.
-4. **Upscaling Pipeline** - Provides hook points where DLSS (via NVIDIA NGX
-   SDK) or other upscaling solutions can process frames.
+### What This Does NOT Do
+
+**This DLL does not enable DLSS 4 or any upscaling technology.** DLSS requires:
+
+- **NVIDIA NGX SDK runtime** (`nvngx_dlss.dll`) — a proprietary NVIDIA binary
+  that cannot be redistributed in this DLL.
+- **Per-frame motion vectors** — DLSS needs pixel-accurate motion data every
+  frame. The DX8 EverQuest client does not expose this.
+- **Depth buffer access** — DLSS requires the scene depth buffer. DX8 does
+  not provide a mechanism to share this with a DX11 device.
+- **Sub-pixel jitter** — DLSS requires the camera to be jittered each frame
+  by a sub-pixel offset. This DLL does not modify EQ's rendering pipeline.
+
+The DX11 bridge is a foundation layer. Actual DLSS integration would require
+significant additional work (motion vector estimation, depth reconstruction)
+and the external NVIDIA NGX runtime.
 
 ### Configuration
 
-Add the following section to your `eqclient.ini` file:
+Add to your `eqclient.ini`:
 
 ```ini
 [DXUpgrade]
-; Master enable/disable for the DX upgrade pipeline
+; Enable the DX11 rendering bridge (TRUE/FALSE)
 Enabled=TRUE
-
-; Upscaling quality mode:
-;   0 = Off (no upscaling, just DX upgrade)
-;   1 = Quality (highest quality, least performance gain)
-;   2 = Balanced
-;   3 = Performance
-;   4 = Ultra Performance (lowest quality, most performance gain)
-UpscaleMode=2
-
-; Internal render resolution scale percentage (25-100)
-; Lower values = more upscaling needed = more performance gain
-RenderScale=75
-
-; Enable HDR output (requires HDR-capable monitor)
-EnableHDR=FALSE
 ```
 
 ### Requirements
 
-- **NVIDIA GPU** - Required for DLSS. The module auto-detects NVIDIA GPUs via
-  DXGI adapter enumeration (vendor ID 0x10DE). If no NVIDIA GPU is found,
-  upscaling is disabled.
-- **Windows 10+** - Required for DirectX 11 and DXGI 1.1+ support.
-- **NVIDIA Drivers** - Latest Game Ready or Studio drivers recommended for
-  DLSS 4 support.
-- **DLSS Runtime** *(optional)* - For full DLSS integration, place
-  `nvngx_dlss.dll` from the NVIDIA NGX SDK in the game directory. Without
-  this, the DX upgrade pipeline is active but upscaling passes through.
+- **Windows 10+** — Required for DirectX 11 and DXGI 1.1+.
+- **Any GPU with D3D11 support** — NVIDIA, AMD, or Intel.
 
 ### Building
 

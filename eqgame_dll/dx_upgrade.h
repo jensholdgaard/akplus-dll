@@ -2,59 +2,53 @@
 
 #include <windows.h>
 
-// DX Upgrade and DLSS Support
+// DX11 Rendering Bridge
 //
-// This module provides infrastructure for upgrading the EverQuest client's
-// DirectX 8 rendering pipeline to support newer DirectX features, enabling
-// NVIDIA DLSS 4 and other modern upscaling technologies.
+// This module creates a parallel DirectX 11 device alongside EverQuest's
+// native DirectX 8 renderer. It hooks the DX8 Present call and captures
+// each rendered frame into a D3D11 texture via GDI, then presents it
+// through a modern DXGI swap chain.
 //
-// How it works:
-//   1. Hooks the DX8 device's Present call via vtable patching
-//   2. Creates a D3D11 device and DXGI swap chain for the same GPU
-//   3. After each DX8 frame, copies the backbuffer to a D3D11 texture
-//   4. Applies upscaling (DLSS/FSR) on the D3D11 texture
-//   5. Presents the upscaled frame via the DXGI swap chain
+// What this provides:
+//   - A D3D11 device and DXGI swap chain running on the same GPU
+//   - Per-frame capture of the DX8 backbuffer into a D3D11 texture
+//   - A foundation that future upscaling integrations could build on
+//
+// What this does NOT provide:
+//   - DLSS 4 or any upscaling. DLSS requires the NVIDIA NGX SDK runtime
+//     (nvngx_dlss.dll), per-frame motion vectors, depth buffers, and
+//     sub-pixel jitter — none of which are available from the DX8 client.
+//   - Any visual improvement over the native DX8 renderer.
+//   - GPU-accelerated frame capture (uses GDI BitBlt, which is CPU-bound).
 //
 // Configuration is done via [DXUpgrade] section in eqclient.ini
 
-// Upscaling quality modes (maps to DLSS quality presets)
-enum UpscaleMode {
-	UPSCALE_OFF              = 0,
-	UPSCALE_QUALITY          = 1,  // DLSS Quality
-	UPSCALE_BALANCED         = 2,  // DLSS Balanced
-	UPSCALE_PERFORMANCE      = 3,  // DLSS Performance
-	UPSCALE_ULTRA_PERF       = 4   // DLSS Ultra Performance
-};
-
 // Configuration loaded from eqclient.ini [DXUpgrade] section
 struct DXUpgradeConfig {
-	bool enabled;            // Master enable/disable for DX upgrade
-	int  upscaleMode;        // UpscaleMode enum value
-	int  renderScale;        // Internal render scale percentage (25-100)
-	bool enableHDR;          // HDR output (requires monitor support)
+	bool enabled;            // Master enable/disable for DX11 bridge
 };
 
-// Initialize the DX upgrade system.
+// Initialize the DX11 bridge.
 // Must be called after the DX8 device is available (d3dDevicePtr is set).
 // d3dDevicePtr: address in EQGfx_Dx8.dll containing the IDirect3DDevice8*
 // hwnd: game window handle
 bool InitDXUpgrade(DWORD d3dDevicePtr, HWND hwnd);
 
-// Shutdown the DX upgrade system and restore original DX8 Present.
+// Shutdown the DX11 bridge and restore original DX8 Present.
 void ShutdownDXUpgrade();
 
-// Load DX upgrade settings from eqclient.ini [DXUpgrade] section.
+// Load settings from eqclient.ini [DXUpgrade] section.
 DXUpgradeConfig LoadDXUpgradeConfig();
 
-// Check if an NVIDIA GPU is present (required for DLSS).
+// Check if an NVIDIA GPU is present.
 bool CheckNvidiaGPU();
 
-// Returns true if the DX upgrade system is currently active.
+// Returns true if the DX11 bridge is currently active.
 bool IsDXUpgradeActive();
 
-// Returns the current DX upgrade configuration.
+// Returns the current configuration.
 const DXUpgradeConfig& GetDXUpgradeConfig();
 
 // Get the name of the GPU adapter being used for D3D11 rendering.
-// Returns empty string if DX upgrade is not initialized.
+// Returns empty string if not initialized.
 const char* GetDXUpgradeGPUName();
