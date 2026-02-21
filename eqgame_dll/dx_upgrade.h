@@ -54,3 +54,7 @@ bool IsDXUpgradeActive();
 
 // Returns the current DX upgrade configuration.
 const DXUpgradeConfig& GetDXUpgradeConfig();
+
+// Get the name of the GPU adapter being used for D3D11 rendering.
+// Returns empty string if DX upgrade is not initialized.
+const char* GetDXUpgradeGPUName();

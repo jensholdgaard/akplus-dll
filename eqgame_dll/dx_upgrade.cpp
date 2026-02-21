@@ -101,6 +101,9 @@ static UINT g_frameHeight = 0;
 // NVIDIA GPU detection flag
 static bool g_isNvidiaGPU = false;
 
+// GPU adapter name (for logging/status)
+static char g_gpuName[128] = { 0 };
+
 // ---------------------------------------------------------------------------
 // Forward declarations
 // ---------------------------------------------------------------------------
@@ -110,6 +113,8 @@ static void ReleaseUpscaleResources();
 static void ReleaseD3D11Device();
 static bool HookDX8Present();
 static void UnhookDX8Present();
+static bool CaptureFrameToStaging();
+static bool CopyStagingToSwapChain();
 
 // ---------------------------------------------------------------------------
 // DXGI Adapter Enumeration and NVIDIA GPU detection
@@ -171,11 +176,15 @@ static bool CreateD3D11Device()
 				if (selectedAdapter)
 					selectedAdapter->Release();
 				selectedAdapter = adapter;
+				// Store GPU name
+				WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, g_gpuName, sizeof(g_gpuName), NULL, NULL);
 				break;
 			}
 			if (!selectedAdapter)
 			{
 				selectedAdapter = adapter;
+				// Store GPU name (may be overwritten if NVIDIA is found later)
+				WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, g_gpuName, sizeof(g_gpuName), NULL, NULL);
 			}
 			else
 			{
@@ -242,7 +251,7 @@ static bool CreateSwapChain(HWND hwnd, UINT width, UINT height)
 	scd.BufferCount = 2;
 	scd.BufferDesc.Width = width;
 	scd.BufferDesc.Height = height;
-	scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	scd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; // Matches GDI capture format
 	scd.BufferDesc.RefreshRate.Numerator = 0;
 	scd.BufferDesc.RefreshRate.Denominator = 1;
 	scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -288,7 +297,7 @@ static bool CreateUpscaleResources(UINT width, UINT height)
 	outputDesc.Height = height;
 	outputDesc.MipLevels = 1;
 	outputDesc.ArraySize = 1;
-	outputDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	outputDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; // Matches staging/swap chain format
 	outputDesc.SampleDesc.Count = 1;
 	outputDesc.Usage = D3D11_USAGE_DEFAULT;
 	outputDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -328,11 +337,130 @@ static void ReleaseD3D11Device()
 }
 
 // ---------------------------------------------------------------------------
+// DX8 → DX11 Frame Capture
+//
+// Captures the DX8-rendered frame from the game window using GDI (BitBlt),
+// then uploads the pixel data into a D3D11 staging texture. This is the most
+// reliable method since DX8 surfaces can't be shared directly with DX11.
+// ---------------------------------------------------------------------------
+static bool CaptureFrameToStaging()
+{
+	if (!g_d3d11Context || !g_stagingTexture || !g_gameHwnd)
+		return false;
+
+	if (g_frameWidth == 0 || g_frameHeight == 0)
+		return false;
+
+	// Get a DC for the game window's client area
+	HDC hdcWindow = GetDC(g_gameHwnd);
+	if (!hdcWindow)
+		return false;
+
+	// Create a compatible memory DC and bitmap for BitBlt
+	HDC hdcMem = CreateCompatibleDC(hdcWindow);
+	if (!hdcMem)
+	{
+		ReleaseDC(g_gameHwnd, hdcWindow);
+		return false;
+	}
+
+	// Set up BITMAPINFO for a 32bpp BGRA bitmap matching the frame size
+	BITMAPINFO bmi;
+	ZeroMemory(&bmi, sizeof(bmi));
+	bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+	bmi.bmiHeader.biWidth = (LONG)g_frameWidth;
+	bmi.bmiHeader.biHeight = -(LONG)g_frameHeight; // top-down
+	bmi.bmiHeader.biPlanes = 1;
+	bmi.bmiHeader.biBitCount = 32;
+	bmi.bmiHeader.biCompression = BI_RGB;
+
+	void* pBits = nullptr;
+	HBITMAP hBitmap = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
+	if (!hBitmap || !pBits)
+	{
+		DeleteDC(hdcMem);
+		ReleaseDC(g_gameHwnd, hdcWindow);
+		return false;
+	}
+
+	HGDIOBJ hOld = SelectObject(hdcMem, hBitmap);
+
+	// Copy the game window's rendered content into our bitmap
+	BOOL bltResult = BitBlt(hdcMem, 0, 0, (int)g_frameWidth, (int)g_frameHeight,
+		hdcWindow, 0, 0, SRCCOPY);
+
+	SelectObject(hdcMem, hOld);
+
+	bool success = false;
+
+	if (bltResult)
+	{
+		// Map the D3D11 staging texture and copy the captured pixels into it
+		D3D11_MAPPED_SUBRESOURCE mapped;
+		HRESULT hr = g_d3d11Context->Map(g_stagingTexture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+		if (SUCCEEDED(hr))
+		{
+			// Copy row by row (source and dest pitches may differ)
+			UINT srcPitch = g_frameWidth * 4; // 32bpp = 4 bytes per pixel
+			BYTE* pSrc = (BYTE*)pBits;
+			BYTE* pDst = (BYTE*)mapped.pData;
+
+			for (UINT y = 0; y < g_frameHeight; y++)
+			{
+				memcpy(pDst, pSrc, srcPitch);
+				pSrc += srcPitch;
+				pDst += mapped.RowPitch;
+			}
+
+			g_d3d11Context->Unmap(g_stagingTexture, 0);
+			success = true;
+		}
+	}
+
+	// Clean up GDI objects
+	DeleteObject(hBitmap);
+	DeleteDC(hdcMem);
+	ReleaseDC(g_gameHwnd, hdcWindow);
+
+	return success;
+}
+
+// ---------------------------------------------------------------------------
+// Copy staging texture to the DXGI swap chain back buffer
+// ---------------------------------------------------------------------------
+static bool CopyStagingToSwapChain()
+{
+	if (!g_d3d11Context || !g_stagingTexture || !g_dxgiSwapChain)
+		return false;
+
+	// Get the swap chain's back buffer
+	ID3D11Texture2D* pBackBuffer = nullptr;
+	HRESULT hr = g_dxgiSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&pBackBuffer);
+	if (FAILED(hr) || !pBackBuffer)
+		return false;
+
+	// Copy the staging texture to the back buffer
+	// The staging texture is BGRA, back buffer is RGBA — CopyResource handles
+	// format conversion if the textures are compatible in dimension/type
+	g_d3d11Context->CopyResource(pBackBuffer, g_stagingTexture);
+
+	pBackBuffer->Release();
+	return true;
+}
+
+// ---------------------------------------------------------------------------
 // Hooked DX8 Present
 //
 // This intercepts every frame presented by the DX8 device. After the original
-// DX8 Present completes, we copy the rendered frame to our D3D11 pipeline
-// for upscaling (DLSS/FSR) and present the upscaled result.
+// DX8 Present completes, we capture the rendered frame via GDI, upload it to
+// a D3D11 staging texture, copy to the swap chain back buffer, and present
+// the frame through the DX11/DXGI pipeline.
+//
+// When DLSS or another upscaler is integrated, the upscaling step would be
+// inserted between the staging texture upload and the swap chain copy:
+//   1. CaptureFrameToStaging()     — DX8 frame → staging texture
+//   2. DLSS evaluate               — staging → output texture (upscaled)
+//   3. Copy output → swap chain    — present upscaled frame
 // ---------------------------------------------------------------------------
 static HRESULT __stdcall HookedPresent(
 	void* pDevice,
@@ -344,42 +472,28 @@ static HRESULT __stdcall HookedPresent(
 	// Call the original DX8 Present first
 	HRESULT hr = g_originalPresent(pDevice, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
 
-	// If upscaling is not enabled, just return
-	if (!g_dxUpgradeActive || g_dxConfig.upscaleMode == UPSCALE_OFF)
+	// If DX upgrade is not active, just return
+	if (!g_dxUpgradeActive)
 		return hr;
 
 	if (!g_d3d11Device || !g_d3d11Context || !g_dxgiSwapChain)
 		return hr;
 
-	// -------------------------------------------------------------------
-	// DLSS/Upscaling Integration Point
-	//
-	// At this point the DX8 frame has been rendered and presented.
-	// To integrate DLSS 4, an NVIDIA NGX/Streamline plugin would:
-	//
-	// 1. Use GetFrontBuffer or a shared surface to read the DX8 frame
-	//    into the g_stagingTexture (D3D11 dynamic texture)
-	//
-	// 2. Pass the staging texture to the DLSS evaluator:
-	//    - NVSDK_NGX_D3D11_EvaluateFeature(g_d3d11Context, ...)
-	//    - With NVSDK_NGX_Parameter_Set for input/output textures,
-	//      motion vectors, depth buffer, etc.
-	//
-	// 3. The DLSS output goes to g_outputTexture
-	//
-	// 4. Copy g_outputTexture to the swap chain back buffer
-	//
-	// 5. Present via the DXGI swap chain
-	//
-	// This requires the NVIDIA NGX SDK runtime (nvngx_dlss.dll) to be
-	// present in the game directory. See README.md for setup instructions.
-	// -------------------------------------------------------------------
+	// Step 1: Capture the DX8-rendered frame into the D3D11 staging texture
+	if (!CaptureFrameToStaging())
+		return hr;
 
-	// Present the upscaled frame via DXGI swap chain
-	if (g_dxgiSwapChain)
-	{
-		g_dxgiSwapChain->Present(0, 0);
-	}
+	// Step 2: (Future) Apply DLSS/FSR upscaling here
+	// If upscaleMode != UPSCALE_OFF && g_isNvidiaGPU:
+	//   NVSDK_NGX_D3D11_EvaluateFeature(g_d3d11Context, ...)
+	//   Copy g_outputTexture → swap chain back buffer
+	// Else: pass-through (copy staging directly to swap chain)
+
+	// Step 3: Copy the staging texture (or upscaled output) to the swap chain
+	CopyStagingToSwapChain();
+
+	// Step 4: Present the frame through the DXGI swap chain
+	g_dxgiSwapChain->Present(g_dxConfig.upscaleMode != UPSCALE_OFF ? 0 : 1, 0);
 
 	return hr;
 }
