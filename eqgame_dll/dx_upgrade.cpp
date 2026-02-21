@@ -70,7 +70,7 @@ typedef HRESULT(__stdcall* D3D8GetDisplayMode_t)(
 // ---------------------------------------------------------------------------
 static bool g_dxUpgradeInitialized = false;
 static bool g_dxUpgradeActive = false;
-static DXUpgradeConfig g_dxConfig = { false, false, 0.5f };
+static DXUpgradeConfig g_dxConfig = { false, false, 0.5f, false };
 
 // DX8 device pointer location (in EQGfx_Dx8.dll)
 static DWORD g_d3d8DevicePtr = 0;
@@ -105,6 +105,10 @@ static bool g_isNvidiaGPU = false;
 // GPU adapter name (for logging/status)
 static char g_gpuName[128] = { 0 };
 
+// Cached DX8 backbuffer dimensions (for letterbox aspect ratio correction)
+static UINT g_dx8BackbufferWidth = 0;
+static UINT g_dx8BackbufferHeight = 0;
+
 // ---------------------------------------------------------------------------
 // Forward declarations
 // ---------------------------------------------------------------------------
@@ -116,6 +120,7 @@ static bool HookDX8Present();
 static void UnhookDX8Present();
 static bool CaptureFrameToStaging();
 static bool CopyStagingToSwapChain();
+static bool QueryDX8BackbufferSize(UINT* outWidth, UINT* outHeight);
 
 // ---------------------------------------------------------------------------
 // DXGI Adapter Enumeration and NVIDIA GPU detection
@@ -341,7 +346,74 @@ static void ReleaseD3D11Device()
 // Captures the DX8-rendered frame from the game window using GDI (BitBlt),
 // then uploads the pixel data into a D3D11 staging texture. This is the most
 // reliable method since DX8 surfaces can't be shared directly with DX11.
+//
+// When letterbox mode is enabled and DX8 backbuffer dimensions are known,
+// StretchBlt is used to preserve the original aspect ratio with pillarbox
+// or letterbox bars (black).
 // ---------------------------------------------------------------------------
+
+// Query DX8 backbuffer dimensions from the device via vtable.
+// IDirect3DSurface8::GetDesc returns D3DSURFACE_DESC with Width at offset 24
+// and Height at offset 28.
+static bool QueryDX8BackbufferSize(UINT* outWidth, UINT* outHeight)
+{
+	if (g_d3d8DevicePtr == 0)
+		return false;
+
+	void* pDevice = *(void**)g_d3d8DevicePtr;
+	if (!pDevice)
+		return false;
+
+	DWORD* devVtable = *(DWORD**)pDevice;
+	if (!devVtable)
+		return false;
+
+	// IDirect3DDevice8::GetBackBuffer(UINT BackBuffer, DWORD Type, IDirect3DSurface8**)
+	// vtable[16], Type 0 = D3DBACKBUFFER_TYPE_MONO
+	typedef HRESULT(__stdcall* GetBackBuffer_t)(void*, UINT, DWORD, void**);
+	GetBackBuffer_t fnGetBackBuffer = (GetBackBuffer_t)devVtable[D3D8_VTABLE_INDEX_GETBACKBUFFER];
+
+	void* pSurface = nullptr;
+	HRESULT hr = fnGetBackBuffer(pDevice, 0, 0, &pSurface);
+	if (FAILED(hr) || !pSurface)
+		return false;
+
+	DWORD* surfVtable = *(DWORD**)pSurface;
+
+	// D3DSURFACE_DESC8 layout (32 bytes total):
+	//   offset  0: Format (4 bytes)
+	//   offset  4: Type (4 bytes)
+	//   offset  8: Usage (4 bytes)
+	//   offset 12: Pool (4 bytes)
+	//   offset 16: Size (4 bytes)
+	//   offset 20: MultiSampleType (4 bytes)
+	//   offset 24: Width (4 bytes)
+	//   offset 28: Height (4 bytes)
+	BYTE desc[32];
+	ZeroMemory(desc, sizeof(desc));
+
+	// IDirect3DSurface8 vtable: [0] QI, [1] AddRef, [2] Release, ... [8] GetDesc
+	static const int SURFACE_VTABLE_RELEASE = 2;
+	static const int SURFACE_VTABLE_GETDESC = 8;
+
+	typedef HRESULT(__stdcall* SurfGetDesc_t)(void*, void*);
+	SurfGetDesc_t fnGetDesc = (SurfGetDesc_t)surfVtable[SURFACE_VTABLE_GETDESC];
+
+	hr = fnGetDesc(pSurface, desc);
+
+	// Release surface
+	typedef ULONG(__stdcall* Release_t)(void*);
+	Release_t fnRelease = (Release_t)surfVtable[SURFACE_VTABLE_RELEASE];
+	fnRelease(pSurface);
+
+	if (FAILED(hr))
+		return false;
+
+	*outWidth = *(UINT*)(desc + 24);
+	*outHeight = *(UINT*)(desc + 28);
+	return (*outWidth > 0 && *outHeight > 0);
+}
+
 static bool CaptureFrameToStaging()
 {
 	if (!g_d3d11Context || !g_stagingTexture || !g_gameHwnd)
@@ -384,11 +456,49 @@ static bool CaptureFrameToStaging()
 
 	HGDIOBJ hOld = SelectObject(hdcMem, hBitmap);
 
-	// Copy the game window's rendered content into our bitmap.
-	// Note: BitBlt is CPU-bound and adds per-frame overhead (~1-3ms at 1080p).
-	// This is a fundamental limitation of bridging DX8→DX11 via GDI.
-	BOOL bltResult = BitBlt(hdcMem, 0, 0, (int)g_frameWidth, (int)g_frameHeight,
-		hdcWindow, 0, 0, SRCCOPY);
+	BOOL bltResult = FALSE;
+
+	// Letterbox/pillarbox: preserve DX8 backbuffer aspect ratio on widescreen
+	if (g_dxConfig.letterboxEnabled && g_dx8BackbufferWidth > 0 && g_dx8BackbufferHeight > 0)
+	{
+		// Clear bitmap to black (for pillarbox/letterbox bars)
+		memset(pBits, 0, g_frameWidth * g_frameHeight * 4);
+
+		// Compute destination rect that preserves the DX8 backbuffer aspect ratio
+		float srcAspect = (float)g_dx8BackbufferWidth / (float)g_dx8BackbufferHeight;
+		float dstAspect = (float)g_frameWidth / (float)g_frameHeight;
+
+		int dstX = 0, dstY = 0;
+		int dstW = (int)g_frameWidth, dstH = (int)g_frameHeight;
+
+		if (srcAspect < dstAspect)
+		{
+			// Window is wider than content: pillarbox (bars on sides)
+			dstW = (int)(g_frameHeight * srcAspect);
+			dstX = ((int)g_frameWidth - dstW) / 2;
+		}
+		else if (srcAspect > dstAspect)
+		{
+			// Window is taller than content: letterbox (bars on top/bottom)
+			dstH = (int)(g_frameWidth / srcAspect);
+			dstY = ((int)g_frameHeight - dstH) / 2;
+		}
+
+		// StretchBlt from full window → centered content rect in DIB.
+		// This un-stretches the DX8 content back to correct aspect ratio.
+		SetStretchBltMode(hdcMem, HALFTONE);
+		SetBrushOrgEx(hdcMem, 0, 0, NULL);
+		bltResult = StretchBlt(
+			hdcMem, dstX, dstY, dstW, dstH,
+			hdcWindow, 0, 0, (int)g_frameWidth, (int)g_frameHeight,
+			SRCCOPY);
+	}
+	else
+	{
+		// No letterbox: full 1:1 BitBlt
+		bltResult = BitBlt(hdcMem, 0, 0, (int)g_frameWidth, (int)g_frameHeight,
+			hdcWindow, 0, 0, SRCCOPY);
+	}
 
 	SelectObject(hdcMem, hOld);
 
@@ -472,6 +582,12 @@ static HRESULT __stdcall HookedPresent(
 	if (!g_d3d11Device || !g_d3d11Context || !g_dxgiSwapChain)
 		return hr;
 
+	// Query DX8 backbuffer size for letterbox (cached, re-queried on Reset)
+	if (g_dxConfig.letterboxEnabled && g_dx8BackbufferWidth == 0)
+	{
+		QueryDX8BackbufferSize(&g_dx8BackbufferWidth, &g_dx8BackbufferHeight);
+	}
+
 	// Step 1: Capture the DX8-rendered frame into the D3D11 staging texture
 	if (!CaptureFrameToStaging())
 		return hr;
@@ -526,12 +642,28 @@ static HRESULT __stdcall HookedReset(
 		g_dxgiSwapChain = nullptr;
 	}
 
+	// Reset cached DX8 backbuffer dimensions (will be re-queried after reset)
+	g_dx8BackbufferWidth = 0;
+	g_dx8BackbufferHeight = 0;
+
 	// Call original Reset
 	HRESULT hr = g_originalReset(pDevice, pPresentationParameters);
 
 	// Recreate resources if reset succeeded and bridge is still enabled
 	if (SUCCEEDED(hr) && g_dxConfig.enabled)
 	{
+		// Read DX8 backbuffer dims from PresentationParameters if available
+		// D3DPRESENT_PARAMETERS8: BackBufferWidth at offset 0, BackBufferHeight at offset 4
+		if (pPresentationParameters)
+		{
+			UINT* pParams = (UINT*)pPresentationParameters;
+			if (pParams[0] > 0 && pParams[1] > 0)
+			{
+				g_dx8BackbufferWidth = pParams[0];
+				g_dx8BackbufferHeight = pParams[1];
+			}
+		}
+
 		RECT clientRect;
 		if (GetClientRect(g_gameHwnd, &clientRect))
 		{
@@ -646,6 +778,11 @@ DXUpgradeConfig LoadDXUpgradeConfig()
 	if (sharpnessInt < 0) sharpnessInt = 0;
 	if (sharpnessInt > 100) sharpnessInt = 100;
 	config.sharpness = sharpnessInt / 100.0f;
+
+	// [DXUpgrade] Letterbox=TRUE (preserve 4:3 aspect with pillarbox bars)
+	sprintf(szDefault, "%s", "TRUE");
+	GetPrivateProfileStringA("DXUpgrade", "Letterbox", szDefault, szResult, 255, "./eqclient.ini");
+	config.letterboxEnabled = (!strcmp(szResult, "TRUE") || !strcmp(szResult, "true") || !strcmp(szResult, "1"));
 
 	return config;
 }

@@ -14,6 +14,7 @@
 //   - A D3D11 device and DXGI swap chain running on the same GPU
 //   - Per-frame capture of the DX8 backbuffer into a D3D11 texture
 //   - GPU-accelerated adaptive sharpening via D3D11 compute shader
+//   - Letterbox/pillarbox aspect ratio correction for widescreen displays
 //   - Works on any GPU (NVIDIA, AMD, Intel) with D3D11 support
 //
 // Why not DLSS 4 (NVIDIA NGX SDK)?
@@ -29,6 +30,7 @@ struct DXUpgradeConfig {
 	bool  enabled;           // Master enable/disable for DX11 bridge
 	bool  sharpenEnabled;    // Enable GPU sharpening pass
 	float sharpness;         // Sharpness intensity 0.0-1.0 (default 0.5)
+	bool  letterboxEnabled;  // Preserve 4:3 aspect with pillarbox bars on widescreen
 };
 
 // Initialize the DX11 bridge.

@@ -20,7 +20,11 @@ a modern DXGI swap chain.
    Contrast Adaptive Sharpening to the captured frame. The shader analyzes
    local contrast in a 3×3 neighborhood and applies adaptive sharpening
    that enhances detail without over-sharpening edges.
-5. **DXGI Swap Chain** — Copies the sharpened output to the swap chain
+5. **Letterbox/Pillarbox** — Queries the DX8 backbuffer dimensions to detect
+   the native render aspect ratio (typically 4:3). When the window is
+   widescreen (16:9), the content is centered with black pillarbox bars on
+   the sides using `StretchBlt` to correct the stretch.
+6. **DXGI Swap Chain** — Copies the sharpened output to the swap chain
    back buffer and presents via DXGI.
 
 ### Why Not DLSS 4 (NVIDIA NGX SDK)?
@@ -54,6 +58,12 @@ Sharpen=TRUE
 ; Sharpness intensity (0-100, default 50)
 ; 0 = no sharpening, 50 = balanced, 100 = maximum
 Sharpness=50
+
+; Preserve 4:3 aspect ratio with pillarbox bars on widescreen (TRUE/FALSE)
+; Queries DX8 backbuffer dimensions and adds black bars on sides/top to
+; prevent stretching. E.g. at 1920x1080 the 4:3 content is centered at
+; ~1440x1080 with 240px black bars on each side.
+Letterbox=TRUE
 ```
 
 ### Requirements
