@@ -112,6 +112,7 @@
     <ClCompile Include="dx_upgrade.cpp" />
     <ClCompile Include="eqgame.cpp" />
     <ClCompile Include="FPSLimit.cpp" />
+    <ClCompile Include="nis_sharpen.cpp" />
     <ClCompile Include="packet_functions.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -120,6 +121,8 @@
     <ClInclude Include="eqgame.h" />
     <ClInclude Include="eqmac.h" />
     <ClInclude Include="eqmac_functions.h" />
+    <ClInclude Include="NIS\NIS_Config.h" />
+    <ClInclude Include="nis_sharpen.h" />
     <ClInclude Include="resource.h" />
   </ItemGroup>
   <ItemGroup>

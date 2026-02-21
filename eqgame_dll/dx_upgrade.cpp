@@ -11,6 +11,7 @@
 #include <dxgi.h>
 #include <d3d11.h>
 #include "dx_upgrade.h"
+#include "nis_sharpen.h"
 
 // ---------------------------------------------------------------------------
 // DX8 Present vtable index (IDirect3DDevice8 vtable layout)
@@ -69,7 +70,7 @@ typedef HRESULT(__stdcall* D3D8GetDisplayMode_t)(
 // ---------------------------------------------------------------------------
 static bool g_dxUpgradeInitialized = false;
 static bool g_dxUpgradeActive = false;
-static DXUpgradeConfig g_dxConfig = { false };
+static DXUpgradeConfig g_dxConfig = { false, false, 0.5f };
 
 // DX8 device pointer location (in EQGfx_Dx8.dll)
 static DWORD g_d3d8DevicePtr = 0;
@@ -90,6 +91,9 @@ static IDXGISwapChain* g_dxgiSwapChain = nullptr;
 
 // D3D11 staging texture for receiving DX8 frame data via GDI
 static ID3D11Texture2D* g_stagingTexture = nullptr;
+
+// D3D11 output texture for sharpening pass (needs UAV binding)
+static ID3D11Texture2D* g_outputTexture = nullptr;
 
 // Frame dimensions
 static UINT g_frameWidth = 0;
@@ -264,6 +268,7 @@ static bool CreateSwapChain(HWND hwnd, UINT width, UINT height)
 
 // ---------------------------------------------------------------------------
 // Staging Texture (CPU-writable texture for DX8->DX11 frame copy via GDI)
+// and Output Texture (GPU-writable for sharpening pass, needs UAV binding)
 // ---------------------------------------------------------------------------
 static bool CreateStagingTexture(UINT width, UINT height)
 {
@@ -286,6 +291,25 @@ static bool CreateStagingTexture(UINT width, UINT height)
 	if (FAILED(hr))
 		return false;
 
+	// Output texture for sharpening pass (needs UAV for compute shader output)
+	D3D11_TEXTURE2D_DESC outputDesc;
+	ZeroMemory(&outputDesc, sizeof(outputDesc));
+	outputDesc.Width = width;
+	outputDesc.Height = height;
+	outputDesc.MipLevels = 1;
+	outputDesc.ArraySize = 1;
+	outputDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+	outputDesc.SampleDesc.Count = 1;
+	outputDesc.Usage = D3D11_USAGE_DEFAULT;
+	outputDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+
+	hr = g_d3d11Device->CreateTexture2D(&outputDesc, NULL, &g_outputTexture);
+	if (FAILED(hr))
+	{
+		// Sharpening output failed, but staging still works — continue without sharpening
+		g_outputTexture = nullptr;
+	}
+
 	g_frameWidth = width;
 	g_frameHeight = height;
 
@@ -294,6 +318,7 @@ static bool CreateStagingTexture(UINT width, UINT height)
 
 static void ReleaseStagingTexture()
 {
+	if (g_outputTexture) { g_outputTexture->Release(); g_outputTexture = nullptr; }
 	if (g_stagingTexture) { g_stagingTexture->Release(); g_stagingTexture = nullptr; }
 }
 
@@ -427,14 +452,8 @@ static bool CopyStagingToSwapChain()
 //
 // This intercepts every frame presented by the DX8 device. After the original
 // DX8 Present completes, we capture the rendered frame via GDI, upload it to
-// a D3D11 staging texture, copy to the swap chain back buffer, and present
-// the frame through the DX11/DXGI pipeline.
-//
-// When DLSS or another upscaler is integrated, the upscaling step would be
-// inserted between the staging texture upload and the swap chain copy:
-//   1. CaptureFrameToStaging()     — DX8 frame → staging texture
-//   2. DLSS evaluate               — staging → output texture (upscaled)
-//   3. Copy output → swap chain    — present upscaled frame
+// a D3D11 staging texture, optionally apply GPU sharpening, then copy the
+// result to the swap chain back buffer and present via DXGI.
 // ---------------------------------------------------------------------------
 static HRESULT __stdcall HookedPresent(
 	void* pDevice,
@@ -457,8 +476,30 @@ static HRESULT __stdcall HookedPresent(
 	if (!CaptureFrameToStaging())
 		return hr;
 
-	// Step 2: Copy the staging texture to the swap chain back buffer
-	CopyStagingToSwapChain();
+	// Step 2: Apply GPU sharpening if enabled and available
+	if (g_dxConfig.sharpenEnabled && IsNISSharpenReady() && g_outputTexture)
+	{
+		if (ApplyNISSharpen(g_d3d11Context, g_stagingTexture, g_outputTexture, g_dxConfig.sharpness))
+		{
+			// Copy sharpened output to swap chain back buffer
+			ID3D11Texture2D* pBackBuffer = nullptr;
+			if (SUCCEEDED(g_dxgiSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&pBackBuffer)))
+			{
+				g_d3d11Context->CopyResource(pBackBuffer, g_outputTexture);
+				pBackBuffer->Release();
+			}
+		}
+		else
+		{
+			// Sharpening failed, fall back to direct copy
+			CopyStagingToSwapChain();
+		}
+	}
+	else
+	{
+		// No sharpening — direct copy
+		CopyStagingToSwapChain();
+	}
 
 	// Step 3: Present the frame through the DXGI swap chain (no VSync)
 	g_dxgiSwapChain->Present(0, 0);
@@ -476,7 +517,8 @@ static HRESULT __stdcall HookedReset(
 	void* pDevice,
 	void* pPresentationParameters)
 {
-	// Release staging texture before the device reset
+	// Release staging/output textures and NIS before the device reset
+	ShutdownNISSharpen();
 	ReleaseStagingTexture();
 	if (g_dxgiSwapChain)
 	{
@@ -499,6 +541,8 @@ static HRESULT __stdcall HookedReset(
 			{
 				CreateSwapChain(g_gameHwnd, newWidth, newHeight);
 				CreateStagingTexture(newWidth, newHeight);
+				if (g_dxConfig.sharpenEnabled)
+					InitNISSharpen(g_d3d11Device, newWidth, newHeight);
 			}
 		}
 	}
@@ -590,6 +634,19 @@ DXUpgradeConfig LoadDXUpgradeConfig()
 	GetPrivateProfileStringA("DXUpgrade", "Enabled", szDefault, szResult, 255, "./eqclient.ini");
 	config.enabled = (!strcmp(szResult, "TRUE") || !strcmp(szResult, "true") || !strcmp(szResult, "1"));
 
+	// [DXUpgrade] Sharpen=TRUE (enable GPU sharpening)
+	sprintf(szDefault, "%s", "TRUE");
+	GetPrivateProfileStringA("DXUpgrade", "Sharpen", szDefault, szResult, 255, "./eqclient.ini");
+	config.sharpenEnabled = (!strcmp(szResult, "TRUE") || !strcmp(szResult, "true") || !strcmp(szResult, "1"));
+
+	// [DXUpgrade] Sharpness=50 (0-100, maps to 0.0-1.0)
+	sprintf(szDefault, "%d", 50);
+	GetPrivateProfileStringA("DXUpgrade", "Sharpness", szDefault, szResult, 255, "./eqclient.ini");
+	int sharpnessInt = atoi(szResult);
+	if (sharpnessInt < 0) sharpnessInt = 0;
+	if (sharpnessInt > 100) sharpnessInt = 100;
+	config.sharpness = sharpnessInt / 100.0f;
+
 	return config;
 }
 
@@ -647,6 +704,13 @@ bool InitDXUpgrade(DWORD d3dDevicePtr, HWND hwnd)
 		return false;
 	}
 
+	// Initialize NIS GPU sharpening if enabled
+	if (g_dxConfig.sharpenEnabled)
+	{
+		// Non-fatal: if sharpening init fails, we continue without it
+		InitNISSharpen(g_d3d11Device, width, height);
+	}
+
 	// Hook the DX8 device's Present and Reset methods
 	if (!HookDX8Present())
 	{
@@ -666,6 +730,9 @@ void ShutdownDXUpgrade()
 		return;
 
 	g_dxUpgradeActive = false;
+
+	// Shutdown NIS sharpening
+	ShutdownNISSharpen();
 
 	// Restore original DX8 vtable
 	UnhookDX8Present();
