@@ -8,6 +8,7 @@
 #include "eqmac_functions.h"
 #include "eqgame.h"
 #include <dxgi.h>
+#include "dx_upgrade.h"
 #include <ctime>
 #include <iostream>
 #include <fstream>
@@ -742,6 +743,11 @@ public:
 				outstring += std::to_string(refresh);
 				WriteLog(outstring);
 #endif
+				// Initialize DX upgrade for DLSS support if configured
+				if (d3ddev && EQhWnd)
+				{
+					InitDXUpgrade(d3ddev, EQhWnd);
+				}
 			}
 			
 			if (ResolutionStored && startup && GetForegroundWindow() == EQhWnd && !IsIconic(EQhWnd)) {
@@ -5659,6 +5665,9 @@ void ExitHooks()
 	{
 		return;
 	}
+
+	// Shutdown DX upgrade system (restores DX8 vtable, releases D3D11 resources)
+	ShutdownDXUpgrade();
 
 	//RemoveDetour(0x4E829F); // HandleWorldMessage
 	//RemoveDetour(0x4AA8BC); // RenderWorld
