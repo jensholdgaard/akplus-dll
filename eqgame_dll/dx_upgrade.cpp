@@ -1,13 +1,13 @@
-#include <Windows.h>
-#include <stdio.h>
-#include <string>
-
 // The project defines CINTERFACE globally for DX8 C-style COM access.
-// We need C++ style COM interfaces for D3D11/DXGI, so undefine it here.
+// We need C++ style COM interfaces for D3D11/DXGI, so undefine it
+// before any includes (Windows.h pulls in COM headers that check it).
 #ifdef CINTERFACE
 #undef CINTERFACE
 #endif
 
+#include <Windows.h>
+#include <stdio.h>
+#include <string>
 #include <dxgi.h>
 #include <d3d11.h>
 #include "dx_upgrade.h"
