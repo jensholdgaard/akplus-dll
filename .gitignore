@@ -17,3 +17,4 @@ eqgame_dll/[Rr]eleases/
 
 # Visual Studio 2015/2017 cache/options directory
 .vs/
+_codeql_detected_source_root
